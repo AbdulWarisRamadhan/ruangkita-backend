@@ -6,10 +6,10 @@ ARG TARGETARCH
 
 WORKDIR /app
 
-COPY go.mod go.sum ./
-RUN go mod download
-
+COPY go.mod ./
 COPY . .
+
+RUN go mod tidy
 
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" -o /app/server .
