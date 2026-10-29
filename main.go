@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -20,16 +19,19 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"golang.org/x/crypto/bcrypt"
 )
 
 const (
 	sessionLifetime = 7 * 24 * time.Hour
-	maxRequestBody  = 1 << 20
+	maxRequestBody  = 64 << 10
 	loginWindow     = 15 * time.Minute
 	maxLoginFails   = 10
+	maxLoginEntries = 5000
 )
 
 var errInvalidSession = errors.New("sesi tidak valid")
@@ -77,7 +79,7 @@ func blockedLogin(ip string) bool {
 	now := time.Now()
 	record, exists := loginLimiter.records[ip]
 	if !exists {
-		return false
+		return len(loginLimiter.records) >= maxLoginEntries
 	}
 
 	if !now.Before(record.windowEnds) {
@@ -94,8 +96,8 @@ func failedLogin(ip string) {
 
 	now := time.Now()
 
-	// Buang catatan yang kedaluwarsa agar map tidak terus membesar.
-	if len(loginLimiter.records) > 5000 {
+	// Bersihkan catatan kedaluwarsa agar map tetap terbatas.
+	if len(loginLimiter.records) >= maxLoginEntries {
 		for key, record := range loginLimiter.records {
 			if !now.Before(record.windowEnds) {
 				delete(loginLimiter.records, key)
@@ -111,6 +113,9 @@ func failedLogin(ip string) {
 		}
 	}
 
+	if len(loginLimiter.records) >= maxLoginEntries && !exists {
+		return
+	}
 	record.count++
 	loginLimiter.records[ip] = record
 }
@@ -163,7 +168,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
 }
 
 func validText(value string, min, max int) bool {
-	length := len(strings.TrimSpace(value))
+	length := utf8.RuneCountInString(strings.TrimSpace(value))
 	return length >= min && length <= max
 }
 
@@ -185,8 +190,9 @@ func databaseDSN() (string, error) {
 		)
 	}
 
-	if _, err := strconv.Atoi(port); err != nil {
-		return "", errors.New("DB_PORT harus berupa nomor port yang valid")
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return "", errors.New("DB_PORT harus berupa nomor port 1-65535")
 	}
 
 	u := url.URL{
@@ -255,7 +261,8 @@ func bootstrapAdmin(db *sql.DB) error {
 	defer tx.Rollback()
 
 	// Mencegah dua instance backend melakukan bootstrap bersamaan.
-	if _, err := tx.Exec(`SELECT pg_advisory_xact_lock(736219401)`); err != nil {
+	var lockResult any
+	if err := tx.QueryRow(`SELECT pg_advisory_xact_lock(736219401)`).Scan(&lockResult); err != nil {
 		return fmt.Errorf("mengunci bootstrap admin: %w", err)
 	}
 
@@ -270,7 +277,7 @@ func bootstrapAdmin(db *sql.DB) error {
 	}
 
 	password := os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
-	if len(password) < 12 || len(password) > 72 {
+	if len(password) < 12 || len(password) > 72 || !utf8.ValidString(password) {
 		return errors.New(
 			"tabel users kosong: BOOTSTRAP_ADMIN_PASSWORD wajib diatur, " +
 				"minimal 12 dan maksimal 72 byte; gunakan setidaknya 16 karakter",
@@ -413,7 +420,8 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 
 	input.Username = strings.TrimSpace(input.Username)
 	if !validText(input.Username, 1, 50) ||
-		len(input.Password) == 0 || len(input.Password) > 72 {
+		len(input.Username) > 50 ||
+		len(input.Password) == 0 || len(input.Password) > 72 || !utf8.ValidString(input.Password) {
 		failedLogin(ip)
 		writeError(
 			w,
@@ -593,12 +601,14 @@ func (a *App) register(
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 
 	if !validText(input.Username, 3, 50) ||
+		len(input.Username) > 50 ||
 		!validText(input.DisplayName, 1, 100) ||
-		len(input.Password) < 12 || len(input.Password) > 72 {
+		len(input.DisplayName) > 400 ||
+		len(input.Password) < 12 || len(input.Password) > 72 || !utf8.ValidString(input.Password) {
 		writeError(
 			w,
 			http.StatusBadRequest,
-			"Username harus 3-50 karakter, nama 1-100 karakter, " +
+			"Username harus 3-50 karakter, nama 1-100 karakter, "+
 				"dan kata sandi 12-72 byte",
 		)
 		return
@@ -630,7 +640,8 @@ func (a *App) register(
 		&user.IsAdmin,
 	)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			writeError(
 				w,
 				http.StatusConflict,
@@ -674,7 +685,7 @@ func (a *App) changePassword(
 	if len(input.CurrentPassword) == 0 ||
 		len(input.CurrentPassword) > 72 ||
 		len(input.NewPassword) < 12 ||
-		len(input.NewPassword) > 72 {
+		len(input.NewPassword) > 72 || !utf8.ValidString(input.NewPassword) {
 		writeError(
 			w,
 			http.StatusBadRequest,
@@ -1029,9 +1040,9 @@ func (a *App) routes() http.Handler {
 			return
 		}
 
+		w.Header().Add("Vary", "Origin")
 		if origin == allowedOrigin {
 			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-			w.Header().Set("Vary", "Origin")
 			w.Header().Set(
 				"Access-Control-Allow-Headers",
 				"Authorization, Content-Type",
@@ -1043,6 +1054,15 @@ func (a *App) routes() http.Handler {
 		}
 
 		if r.Method == http.MethodOptions {
+			if origin != allowedOrigin || r.Header.Get("Access-Control-Request-Method") == "" {
+				writeError(w, http.StatusForbidden, "Preflight tidak diizinkan")
+				return
+			}
+			method := r.Header.Get("Access-Control-Request-Method")
+			if method != http.MethodGet && method != http.MethodPost {
+				writeError(w, http.StatusMethodNotAllowed, "Metode preflight tidak diizinkan")
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -1096,11 +1116,14 @@ func main() {
 		Addr:              ":8088",
 		Handler:           app.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
 	log.Println("RuangKita backend berjalan di port 8088")
-	log.Fatal(server.ListenAndServe())
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
 }
