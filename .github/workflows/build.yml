@@ -27,7 +27,9 @@ jobs:
           cache: true
 
       - name: Resolve dependencies
-        run: go mod tidy
+        run: |
+          go mod tidy
+          git status --short
 
       - name: Test Go package
         run: go test ./...
