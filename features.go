@@ -57,9 +57,21 @@ func (a *App) ensureFeatures() error {
 }
 
 func (a *App) areContacts(r *http.Request, left, right int64) (bool, error) {
-	var ok bool
-	err := a.db.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM contacts WHERE user_low=LEAST($1,$2) AND user_high=GREATEST($1,$2))`, left, right).Scan(&ok)
-	return ok, err
+    var ok bool
+
+    err := a.db.QueryRowContext(
+        r.Context(),
+        `SELECT EXISTS(
+            SELECT 1
+            FROM contacts
+            WHERE user_low = LEAST($1::BIGINT, $2::BIGINT)
+              AND user_high = GREATEST($1::BIGINT, $2::BIGINT)
+        )`,
+        left,
+        right,
+    ).Scan(&ok)
+
+    return ok, err
 }
 
 func (a *App) contacts(w http.ResponseWriter, r *http.Request, u *User) {
