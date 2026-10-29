@@ -168,8 +168,9 @@ func (a *App) contactRequests(w http.ResponseWriter, r *http.Request, u *User) {
 		}
 		exists, err := a.areContacts(r, u.ID, receiver)
 		if err != nil {
-			writeError(w, 500, "Gagal memeriksa kontak")
-			return
+    		log.Printf("ERROR contactRequests areContacts: %v", err)
+   			writeError(w, 500, "Gagal memeriksa kontak")
+   			return
 		}
 		if exists {
 			writeError(w, 409, "Sudah menjadi kontak")
