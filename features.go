@@ -230,12 +230,24 @@ func (a *App) contactRespond(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 	status := "rejected"
 	if input.Accept {
-		status = "accepted"
-		if _, err = tx.ExecContext(r.Context(), `INSERT INTO contacts(user_low,user_high) VALUES(LEAST($1,$2),GREATEST($1,$2)) ON CONFLICT DO NOTHING`, sender, u.ID); err != nil {
-			writeError(w, 500, "Gagal menambah kontak")
-			return
-		}
-	}
+    status = "accepted"
+
+    if _, err = tx.ExecContext(
+        r.Context(),
+        `INSERT INTO contacts(user_low, user_high)
+         VALUES(
+             LEAST($1::BIGINT, $2::BIGINT),
+             GREATEST($1::BIGINT, $2::BIGINT)
+         )
+         ON CONFLICT DO NOTHING`,
+        sender,
+        u.ID,
+    ); err != nil {
+        log.Printf("ERROR contactRespond INSERT contacts: %v", err)
+        writeError(w, 500, "Gagal menambah kontak")
+        return
+    }
+}
 	if _, err = tx.ExecContext(r.Context(), `UPDATE contact_requests SET status=$1 WHERE id=$2`, status, input.RequestID); err != nil {
 		writeError(w, 500, "Gagal menyimpan permintaan")
 		return
