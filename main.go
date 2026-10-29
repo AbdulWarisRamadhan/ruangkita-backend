@@ -1,3 +1,4 @@
+
 package main
 
 import (
@@ -31,14 +32,10 @@ const (
 	maxRequestBody  = 64 << 10
 	loginWindow     = 15 * time.Minute
 	maxLoginFails   = 10
-	maxLoginEntries = 5000
+	allowedOrigin   = "https://ruangkita-697.pages.dev"
 )
 
-var errInvalidSession = errors.New("sesi tidak valid")
-
-type contextKey string
-
-const userKey contextKey = "authenticated_user"
+var errInvalidSession = errors.New("invalid session")
 
 type User struct {
 	ID          int64  `json:"id"`
@@ -58,6 +55,7 @@ type Message struct {
 type App struct {
 	db        *sql.DB
 	dummyHash []byte
+	limiter   *LoginLimiter
 }
 
 type attemptRecord struct {
@@ -65,65 +63,68 @@ type attemptRecord struct {
 	windowEnds time.Time
 }
 
-var loginLimiter = struct {
-	sync.Mutex
+type LoginLimiter struct {
+	mu      sync.Mutex
 	records map[string]attemptRecord
-}{
-	records: make(map[string]attemptRecord),
 }
 
-func blockedLogin(ip string) bool {
-	loginLimiter.Lock()
-	defer loginLimiter.Unlock()
+func newLoginLimiter() *LoginLimiter {
+	return &LoginLimiter{
+		records: make(map[string]attemptRecord),
+	}
+}
+
+func (l *LoginLimiter) blocked(ip string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	now := time.Now()
-	record, exists := loginLimiter.records[ip]
-	if !exists {
-		return len(loginLimiter.records) >= maxLoginEntries
-	}
-
-	if !now.Before(record.windowEnds) {
-		delete(loginLimiter.records, ip)
+	record, ok := l.records[ip]
+	if !ok {
 		return false
 	}
-
+	if !now.Before(record.windowEnds) {
+		delete(l.records, ip)
+		return false
+	}
 	return record.count >= maxLoginFails
 }
 
-func failedLogin(ip string) {
-	loginLimiter.Lock()
-	defer loginLimiter.Unlock()
+func (l *LoginLimiter) failed(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	now := time.Now()
 
-	// Bersihkan catatan kedaluwarsa agar map tetap terbatas.
-	if len(loginLimiter.records) >= maxLoginEntries {
-		for key, record := range loginLimiter.records {
-			if !now.Before(record.windowEnds) {
-				delete(loginLimiter.records, key)
-			}
+	// Bersihkan entri kedaluwarsa setiap ada kegagalan.
+	for key, record := range l.records {
+		if !now.Before(record.windowEnds) {
+			delete(l.records, key)
 		}
 	}
 
-	record, exists := loginLimiter.records[ip]
-	if !exists || !now.Before(record.windowEnds) {
+	// Batasi jumlah IP yang dapat disimpan dalam memori.
+	if len(l.records) >= 5000 {
+		if _, exists := l.records[ip]; !exists {
+			return
+		}
+	}
+
+	record, ok := l.records[ip]
+	if !ok || !now.Before(record.windowEnds) {
 		record = attemptRecord{
-			count:      0,
 			windowEnds: now.Add(loginWindow),
 		}
 	}
 
-	if len(loginLimiter.records) >= maxLoginEntries && !exists {
-		return
-	}
 	record.count++
-	loginLimiter.records[ip] = record
+	l.records[ip] = record
 }
 
-func clearLoginFailures(ip string) {
-	loginLimiter.Lock()
-	defer loginLimiter.Unlock()
-	delete(loginLimiter.records, ip)
+func (l *LoginLimiter) clear(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.records, ip)
 }
 
 func clientIP(r *http.Request) string {
@@ -134,18 +135,29 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-func writeJSON(w http.ResponseWriter, status int, value any) {
+func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{"error": message})
+	writeJSON(w, status, map[string]string{
+		"error": message,
+	})
+}
+
+func methodNotAllowed(w http.ResponseWriter) {
+	writeError(w, http.StatusMethodNotAllowed,
+		"Metode HTTP tidak diizinkan")
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
+	if r.Body == nil {
+		return errors.New("body kosong")
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 
 	decoder := json.NewDecoder(r.Body)
@@ -156,10 +168,9 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
 	}
 
 	var extra any
-	err := decoder.Decode(&extra)
-	if !errors.Is(err, io.EOF) {
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		if err == nil {
-			return errors.New("hanya satu objek JSON yang diizinkan")
+			return errors.New("hanya satu objek JSON diizinkan")
 		}
 		return err
 	}
@@ -168,12 +179,17 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) error {
 }
 
 func validText(value string, min, max int) bool {
-	length := utf8.RuneCountInString(strings.TrimSpace(value))
-	return length >= min && length <= max
+	if !utf8.ValidString(value) {
+		return false
+	}
+	n := utf8.RuneCountInString(strings.TrimSpace(value))
+	return n >= min && n <= max
 }
 
-func methodNotAllowed(w http.ResponseWriter) {
-	writeError(w, http.StatusMethodNotAllowed, "Metode HTTP tidak diizinkan")
+func validPassword(password string) bool {
+	return utf8.ValidString(password) &&
+		len(password) >= 12 &&
+		len(password) <= 72
 }
 
 func databaseDSN() (string, error) {
@@ -185,14 +201,23 @@ func databaseDSN() (string, error) {
 
 	if host == "" || port == "" || name == "" ||
 		user == "" || password == "" {
-		return "", errors.New(
-			"DB_HOST, DB_PORT, DB_NAME, DB_USER, dan DB_PASSWORD wajib diatur",
-		)
+		return "", errors.New("konfigurasi database belum lengkap")
 	}
 
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return "", errors.New("DB_PORT harus berupa nomor port 1-65535")
+		return "", errors.New("DB_PORT tidak valid")
+	}
+
+	sslMode := strings.TrimSpace(os.Getenv("DB_SSLMODE"))
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+
+	switch sslMode {
+	case "disable", "require", "verify-ca", "verify-full":
+	default:
+		return "", errors.New("DB_SSLMODE tidak valid")
 	}
 
 	u := url.URL{
@@ -202,20 +227,9 @@ func databaseDSN() (string, error) {
 		Path:   name,
 	}
 
-	query := u.Query()
-
-	sslMode := strings.TrimSpace(os.Getenv("DB_SSLMODE"))
-	if sslMode == "" {
-		sslMode = "disable"
-	}
-	switch sslMode {
-	case "disable", "require", "verify-ca", "verify-full":
-	default:
-		return "", errors.New("DB_SSLMODE tidak valid")
-	}
-
-	query.Set("sslmode", sslMode)
-	u.RawQuery = query.Encode()
+	q := u.Query()
+	q.Set("sslmode", sslMode)
+	u.RawQuery = q.Encode()
 
 	return u.String(), nil
 }
@@ -234,12 +248,17 @@ func tokenHash(token string) string {
 }
 
 func bearerToken(r *http.Request) (string, error) {
-	header := r.Header.Get("Authorization")
-	if !strings.HasPrefix(header, "Bearer ") {
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
 		return "", errInvalidSession
 	}
 
-	token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+	fields := strings.Fields(values[0])
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
+		return "", errInvalidSession
+	}
+
+	token := fields[1]
 	if len(token) != 64 {
 		return "", errInvalidSession
 	}
@@ -247,65 +266,70 @@ func bearerToken(r *http.Request) (string, error) {
 	if _, err := hex.DecodeString(token); err != nil {
 		return "", errInvalidSession
 	}
-
 	return token, nil
 }
 
-// Buat admin awal hanya ketika tabel users benar-benar kosong.
-// BOOTSTRAP_ADMIN_PASSWORD tidak pernah disimpan di source code.
 func bootstrapAdmin(db *sql.DB) error {
-	tx, err := db.Begin()
+	ctx, cancel := context.WithTimeout(
+		context.Background(), 30*time.Second)
+	defer cancel()
+
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("memulai bootstrap admin: %w", err)
+		return fmt.Errorf("memulai bootstrap: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Mencegah dua instance backend melakukan bootstrap bersamaan.
-	var lockResult any
-	if err := tx.QueryRow(`SELECT pg_advisory_xact_lock(736219401)`).Scan(&lockResult); err != nil {
-		return fmt.Errorf("mengunci bootstrap admin: %w", err)
+	// PostgreSQL mengembalikan void.
+	// Cast ke text agar hasil Scan konsisten.
+	var lockResult string
+	err = tx.QueryRowContext(ctx,
+		`SELECT pg_advisory_xact_lock(736219401)::text`,
+	).Scan(&lockResult)
+	if err != nil {
+		return fmt.Errorf("mengunci bootstrap: %w", err)
 	}
 
-	var count int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
-		return fmt.Errorf("memeriksa tabel users: %w", err)
+	var count int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM users`,
+	).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("memeriksa users: %w", err)
 	}
 
 	if count > 0 {
-		log.Println("Bootstrap admin dilewati: akun pengguna sudah tersedia")
+		log.Println("Bootstrap dilewati: pengguna sudah tersedia")
 		return tx.Commit()
 	}
 
 	password := os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
-	if len(password) < 12 || len(password) > 72 || !utf8.ValidString(password) {
+	if !validPassword(password) {
 		return errors.New(
-			"tabel users kosong: BOOTSTRAP_ADMIN_PASSWORD wajib diatur, " +
-				"minimal 12 dan maksimal 72 byte; gunakan setidaknya 16 karakter",
+			"BOOTSTRAP_ADMIN_PASSWORD wajib 12-72 byte UTF-8",
 		)
 	}
 
 	hash, err := bcrypt.GenerateFromPassword(
-		[]byte(password),
-		bcrypt.DefaultCost,
-	)
+		[]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		return fmt.Errorf("membuat hash admin: %w", err)
+		return fmt.Errorf("hash admin: %w", err)
 	}
 
-	_, err = tx.Exec(`
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO users
 			(username, password_hash, display_name, is_admin, is_active)
 		VALUES ($1, $2, $3, TRUE, TRUE)
 	`, "alin", string(hash), "Alin")
 	if err != nil {
-		return fmt.Errorf("menyimpan admin awal: %w", err)
+		return fmt.Errorf("menyimpan admin: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("menyelesaikan bootstrap admin: %w", err)
+		return fmt.Errorf("commit bootstrap: %w", err)
 	}
 
-	log.Println("Akun admin awal berhasil dibuat")
+	log.Println("Bootstrap admin selesai")
 	return nil
 }
 
@@ -329,20 +353,18 @@ func (a *App) authenticate(r *http.Request) (*User, error) {
 		&user.DisplayName,
 		&user.IsAdmin,
 	)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, errInvalidSession
+	}
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errInvalidSession
-		}
 		return nil, err
 	}
-
 	return &user, nil
 }
 
 type authenticatedHandler func(
-	http.ResponseWriter,
-	*http.Request,
-	*User,
+	http.ResponseWriter, *http.Request, *User,
 )
 
 func (a *App) requireAuth(next authenticatedHandler) http.HandlerFunc {
@@ -350,23 +372,15 @@ func (a *App) requireAuth(next authenticatedHandler) http.HandlerFunc {
 		user, err := a.authenticate(r)
 		if err != nil {
 			if errors.Is(err, errInvalidSession) {
-				writeError(
-					w,
-					http.StatusUnauthorized,
-					"Sesi tidak valid atau sudah berakhir",
-				)
+				writeError(w, http.StatusUnauthorized,
+					"Sesi tidak valid atau sudah berakhir")
 				return
 			}
-
-			log.Printf("Kesalahan autentikasi: %v", err)
-			writeError(
-				w,
-				http.StatusInternalServerError,
-				"Gagal memeriksa sesi",
-			)
+			log.Printf("Autentikasi gagal: %v", err)
+			writeError(w, http.StatusInternalServerError,
+				"Gagal memeriksa sesi")
 			return
 		}
-
 		next(w, r, user)
 	}
 }
@@ -381,15 +395,14 @@ func (a *App) health(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	if err := a.db.PingContext(ctx); err != nil {
-		writeError(
-			w,
-			http.StatusServiceUnavailable,
-			"Database tidak tersedia",
-		)
+		writeError(w, http.StatusServiceUnavailable,
+			"Database tidak tersedia")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "ok",
+	})
 }
 
 func (a *App) login(w http.ResponseWriter, r *http.Request) {
@@ -399,12 +412,9 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ip := clientIP(r)
-	if blockedLogin(ip) {
-		writeError(
-			w,
-			http.StatusTooManyRequests,
-			"Terlalu banyak percobaan login. Coba lagi setelah 15 menit.",
-		)
+	if a.limiter.blocked(ip) {
+		writeError(w, http.StatusTooManyRequests,
+			"Terlalu banyak percobaan login")
 		return
 	}
 
@@ -414,20 +424,19 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := decodeJSON(w, r, &input); err != nil {
-		writeError(w, http.StatusBadRequest, "Format JSON tidak valid")
+		writeError(w, http.StatusBadRequest, "JSON tidak valid")
 		return
 	}
 
 	input.Username = strings.TrimSpace(input.Username)
+
 	if !validText(input.Username, 1, 50) ||
-		len(input.Username) > 50 ||
-		len(input.Password) == 0 || len(input.Password) > 72 || !utf8.ValidString(input.Password) {
-		failedLogin(ip)
-		writeError(
-			w,
-			http.StatusUnauthorized,
-			"Username atau kata sandi salah",
-		)
+		!utf8.ValidString(input.Password) ||
+		len(input.Password) == 0 ||
+		len(input.Password) > 72 {
+		a.limiter.failed(ip)
+		writeError(w, http.StatusUnauthorized,
+			"Username atau kata sandi salah")
 		return
 	}
 
@@ -447,70 +456,59 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if errors.Is(err, sql.ErrNoRows) {
-		// Perbandingan dummy mengurangi perbedaan waktu respons
-		// untuk username yang tidak ditemukan.
 		_ = bcrypt.CompareHashAndPassword(
-			a.dummyHash,
-			[]byte(input.Password),
-		)
-		failedLogin(ip)
-		writeError(
-			w,
-			http.StatusUnauthorized,
-			"Username atau kata sandi salah",
-		)
+			a.dummyHash, []byte(input.Password))
+		a.limiter.failed(ip)
+		writeError(w, http.StatusUnauthorized,
+			"Username atau kata sandi salah")
 		return
 	}
 
 	if err != nil {
-		log.Printf("Kesalahan query login: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal memproses login",
-		)
+		log.Printf("Query login gagal: %v", err)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal memproses login")
 		return
 	}
 
 	if bcrypt.CompareHashAndPassword(
-		[]byte(passwordHash),
-		[]byte(input.Password),
-	) != nil {
-		failedLogin(ip)
-		writeError(
-			w,
-			http.StatusUnauthorized,
-			"Username atau kata sandi salah",
-		)
+		[]byte(passwordHash), []byte(input.Password)) != nil {
+		a.limiter.failed(ip)
+		writeError(w, http.StatusUnauthorized,
+			"Username atau kata sandi salah")
 		return
 	}
 
 	token, err := generateToken()
 	if err != nil {
-		log.Printf("Gagal membuat token sesi: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal membuat sesi",
-		)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal membuat sesi")
 		return
 	}
 
-	_, err = a.db.ExecContext(r.Context(), `
+	// Cek ulang status akun pada saat menyimpan sesi.
+	result, err := a.db.ExecContext(r.Context(), `
 		INSERT INTO sessions (user_id, token_hash, expires_at)
-		VALUES ($1, $2, $3)
+		SELECT id, $2, $3
+		FROM users
+		WHERE id = $1 AND is_active = TRUE
 	`, user.ID, tokenHash(token), time.Now().Add(sessionLifetime))
+
 	if err != nil {
-		log.Printf("Gagal menyimpan sesi: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal menyimpan sesi",
-		)
+		log.Printf("Simpan sesi gagal: %v", err)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal menyimpan sesi")
 		return
 	}
 
-	clearLoginFailures(ip)
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 1 {
+		writeError(w, http.StatusUnauthorized,
+			"Akun tidak aktif")
+		return
+	}
+
+	a.limiter.clear(ip)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":      token,
@@ -519,24 +517,15 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *App) me(
-	w http.ResponseWriter,
-	r *http.Request,
-	user *User,
-) {
+func (a *App) me(w http.ResponseWriter, r *http.Request, user *User) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
 		return
 	}
-
 	writeJSON(w, http.StatusOK, user)
 }
 
-func (a *App) logout(
-	w http.ResponseWriter,
-	r *http.Request,
-	user *User,
-) {
+func (a *App) logout(w http.ResponseWriter, r *http.Request, user *User) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
 		return
@@ -549,16 +538,11 @@ func (a *App) logout(
 	}
 
 	_, err = a.db.ExecContext(r.Context(), `
-		DELETE FROM sessions
-		WHERE token_hash = $1
+		DELETE FROM sessions WHERE token_hash = $1
 	`, tokenHash(token))
 	if err != nil {
-		log.Printf("Gagal logout: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal mengakhiri sesi",
-		)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal logout")
 		return
 	}
 
@@ -567,22 +551,15 @@ func (a *App) logout(
 	})
 }
 
-func (a *App) register(
-	w http.ResponseWriter,
-	r *http.Request,
-	admin *User,
-) {
+func (a *App) register(w http.ResponseWriter, r *http.Request, admin *User) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
 		return
 	}
 
 	if !admin.IsAdmin {
-		writeError(
-			w,
-			http.StatusForbidden,
-			"Hanya admin yang dapat membuat akun",
-		)
+		writeError(w, http.StatusForbidden,
+			"Hanya admin yang dapat membuat akun")
 		return
 	}
 
@@ -593,7 +570,7 @@ func (a *App) register(
 	}
 
 	if err := decodeJSON(w, r, &input); err != nil {
-		writeError(w, http.StatusBadRequest, "Format JSON tidak valid")
+		writeError(w, http.StatusBadRequest, "JSON tidak valid")
 		return
 	}
 
@@ -601,30 +578,18 @@ func (a *App) register(
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 
 	if !validText(input.Username, 3, 50) ||
-		len(input.Username) > 50 ||
 		!validText(input.DisplayName, 1, 100) ||
-		len(input.DisplayName) > 400 ||
-		len(input.Password) < 12 || len(input.Password) > 72 || !utf8.ValidString(input.Password) {
-		writeError(
-			w,
-			http.StatusBadRequest,
-			"Username harus 3-50 karakter, nama 1-100 karakter, "+
-				"dan kata sandi 12-72 byte",
-		)
+		!validPassword(input.Password) {
+		writeError(w, http.StatusBadRequest,
+			"Username, nama, atau kata sandi tidak valid")
 		return
 	}
 
 	hash, err := bcrypt.GenerateFromPassword(
-		[]byte(input.Password),
-		bcrypt.DefaultCost,
-	)
+		[]byte(input.Password), bcrypt.DefaultCost)
 	if err != nil {
-		log.Printf("Gagal membuat hash pengguna: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal memproses kata sandi",
-		)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal memproses kata sandi")
 		return
 	}
 
@@ -639,23 +604,18 @@ func (a *App) register(
 		&user.DisplayName,
 		&user.IsAdmin,
 	)
+
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			writeError(
-				w,
-				http.StatusConflict,
-				"Username sudah digunakan",
-			)
+			writeError(w, http.StatusConflict,
+				"Username sudah digunakan")
 			return
 		}
 
-		log.Printf("Gagal membuat akun: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal membuat akun",
-		)
+		log.Printf("Registrasi gagal: %v", err)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal membuat akun")
 		return
 	}
 
@@ -663,9 +623,7 @@ func (a *App) register(
 }
 
 func (a *App) changePassword(
-	w http.ResponseWriter,
-	r *http.Request,
-	user *User,
+	w http.ResponseWriter, r *http.Request, user *User,
 ) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -678,29 +636,22 @@ func (a *App) changePassword(
 	}
 
 	if err := decodeJSON(w, r, &input); err != nil {
-		writeError(w, http.StatusBadRequest, "Format JSON tidak valid")
+		writeError(w, http.StatusBadRequest, "JSON tidak valid")
 		return
 	}
 
 	if len(input.CurrentPassword) == 0 ||
 		len(input.CurrentPassword) > 72 ||
-		len(input.NewPassword) < 12 ||
-		len(input.NewPassword) > 72 || !utf8.ValidString(input.NewPassword) {
-		writeError(
-			w,
-			http.StatusBadRequest,
-			"Kata sandi baru harus 12-72 byte",
-		)
+		!validPassword(input.NewPassword) {
+		writeError(w, http.StatusBadRequest,
+			"Kata sandi tidak valid")
 		return
 	}
 
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal memulai perubahan kata sandi",
-		)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal memulai transaksi")
 		return
 	}
 	defer tx.Rollback()
@@ -713,42 +664,35 @@ func (a *App) changePassword(
 		FOR UPDATE
 	`, user.ID).Scan(&currentHash)
 
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusUnauthorized, "Akun tidak aktif")
+		return
+	}
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeError(w, http.StatusUnauthorized, "Akun tidak aktif")
-			return
-		}
-		log.Printf("Gagal membaca hash kata sandi: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal memeriksa kata sandi",
-		)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal membaca akun")
 		return
 	}
 
 	if bcrypt.CompareHashAndPassword(
-		[]byte(currentHash),
-		[]byte(input.CurrentPassword),
-	) != nil {
-		writeError(
-			w,
-			http.StatusUnauthorized,
-			"Kata sandi saat ini salah",
-		)
+		[]byte(currentHash), []byte(input.CurrentPassword)) != nil {
+		writeError(w, http.StatusUnauthorized,
+			"Kata sandi lama salah")
+		return
+	}
+
+	if bcrypt.CompareHashAndPassword(
+		[]byte(currentHash), []byte(input.NewPassword)) == nil {
+		writeError(w, http.StatusBadRequest,
+			"Kata sandi baru harus berbeda")
 		return
 	}
 
 	newHash, err := bcrypt.GenerateFromPassword(
-		[]byte(input.NewPassword),
-		bcrypt.DefaultCost,
-	)
+		[]byte(input.NewPassword), bcrypt.DefaultCost)
 	if err != nil {
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal memproses kata sandi baru",
-		)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal membuat hash")
 		return
 	}
 
@@ -756,49 +700,32 @@ func (a *App) changePassword(
 		UPDATE users SET password_hash = $1 WHERE id = $2
 	`, string(newHash), user.ID)
 	if err != nil {
-		log.Printf("Gagal mengubah kata sandi: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal mengubah kata sandi",
-		)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal mengganti kata sandi")
 		return
 	}
 
-	// Cabut seluruh sesi akun setelah perubahan kata sandi.
 	_, err = tx.ExecContext(r.Context(), `
 		DELETE FROM sessions WHERE user_id = $1
 	`, user.ID)
 	if err != nil {
-		log.Printf("Gagal mencabut sesi: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal mencabut sesi lama",
-		)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal mencabut sesi")
 		return
 	}
 
 	if err := tx.Commit(); err != nil {
-		log.Printf("Gagal menyimpan perubahan kata sandi: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal menyimpan perubahan",
-		)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal menyimpan perubahan")
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
-		"message": "Kata sandi berhasil diubah. Silakan login kembali.",
+		"message": "Kata sandi diubah. Silakan login kembali.",
 	})
 }
 
-func (a *App) users(
-	w http.ResponseWriter,
-	r *http.Request,
-	current *User,
-) {
+func (a *App) users(w http.ResponseWriter, r *http.Request, current *User) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
 		return
@@ -811,205 +738,162 @@ func (a *App) users(
 		ORDER BY username
 	`)
 	if err != nil {
-		log.Printf("Gagal mengambil pengguna: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal mengambil pengguna",
-		)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal mengambil pengguna")
 		return
 	}
 	defer rows.Close()
 
-	users := make([]User, 0)
+	result := make([]User, 0)
+
 	for rows.Next() {
 		var user User
 		if err := rows.Scan(
-			&user.ID,
-			&user.Username,
-			&user.DisplayName,
-			&user.IsAdmin,
+			&user.ID, &user.Username,
+			&user.DisplayName, &user.IsAdmin,
 		); err != nil {
-			log.Printf("Gagal membaca pengguna: %v", err)
-			writeError(
-				w,
-				http.StatusInternalServerError,
-				"Gagal membaca pengguna",
-			)
+			writeError(w, http.StatusInternalServerError,
+				"Gagal membaca pengguna")
 			return
 		}
-		users = append(users, user)
+		result = append(result, user)
 	}
 
 	if err := rows.Err(); err != nil {
-		log.Printf("Kesalahan hasil query pengguna: %v", err)
-		writeError(
-			w,
-			http.StatusInternalServerError,
-			"Gagal membaca pengguna",
-		)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal membaca pengguna")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, users)
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (a *App) messages(
-	w http.ResponseWriter,
-	r *http.Request,
-	current *User,
+	w http.ResponseWriter, r *http.Request, current *User,
 ) {
 	currentID := strconv.FormatInt(current.ID, 10)
 
 	switch r.Method {
 	case http.MethodGet:
-		rows, err := a.db.QueryContext(r.Context(), `
-			SELECT id, sender_id, receiver_id, content, created_at
-			FROM messages
-			WHERE sender_id = $1 OR receiver_id = $1
-			ORDER BY created_at DESC, id DESC
-			LIMIT 500
-		`, currentID)
-		if err != nil {
-			log.Printf("Gagal mengambil pesan: %v", err)
-			writeError(
-				w,
-				http.StatusInternalServerError,
-				"Gagal mengambil pesan",
-			)
-			return
-		}
-		defer rows.Close()
-
-		messages := make([]Message, 0)
-		for rows.Next() {
-			var message Message
-			if err := rows.Scan(
-				&message.ID,
-				&message.SenderID,
-				&message.ReceiverID,
-				&message.Content,
-				&message.CreatedAt,
-			); err != nil {
-				log.Printf("Gagal membaca pesan: %v", err)
-				writeError(
-					w,
-					http.StatusInternalServerError,
-					"Gagal membaca pesan",
-				)
-				return
-			}
-			messages = append(messages, message)
-		}
-
-		if err := rows.Err(); err != nil {
-			log.Printf("Kesalahan hasil query pesan: %v", err)
-			writeError(
-				w,
-				http.StatusInternalServerError,
-				"Gagal membaca pesan",
-			)
-			return
-		}
-
-		// Kembalikan urutan menjadi yang terlama ke terbaru.
-		for left, right := 0, len(messages)-1; left < right; left, right = left+1, right-1 {
-			messages[left], messages[right] = messages[right], messages[left]
-		}
-
-		writeJSON(w, http.StatusOK, messages)
-
+		a.getMessages(w, r, currentID)
 	case http.MethodPost:
-		var input struct {
-			ReceiverID string `json:"receiver_id"`
-			Content    string `json:"content"`
-		}
-
-		if err := decodeJSON(w, r, &input); err != nil {
-			writeError(w, http.StatusBadRequest, "Format JSON tidak valid")
-			return
-		}
-
-		input.ReceiverID = strings.TrimSpace(input.ReceiverID)
-		input.Content = strings.TrimSpace(input.Content)
-
-		receiverID, err := strconv.ParseInt(input.ReceiverID, 10, 64)
-		if err != nil || receiverID <= 0 ||
-			!validText(input.Content, 1, 4000) {
-			writeError(
-				w,
-				http.StatusBadRequest,
-				"Penerima atau isi pesan tidak valid",
-			)
-			return
-		}
-
-		if receiverID == current.ID {
-			writeError(
-				w,
-				http.StatusBadRequest,
-				"Tidak dapat mengirim pesan kepada diri sendiri",
-			)
-			return
-		}
-
-		var active bool
-		err = a.db.QueryRowContext(r.Context(), `
-			SELECT EXISTS (
-				SELECT 1 FROM users
-				WHERE id = $1 AND is_active = TRUE
-			)
-		`, receiverID).Scan(&active)
-		if err != nil {
-			log.Printf("Gagal memeriksa penerima: %v", err)
-			writeError(
-				w,
-				http.StatusInternalServerError,
-				"Gagal memeriksa penerima",
-			)
-			return
-		}
-
-		if !active {
-			writeError(
-				w,
-				http.StatusNotFound,
-				"Penerima tidak ditemukan",
-			)
-			return
-		}
-
-		var message Message
-		err = a.db.QueryRowContext(r.Context(), `
-			INSERT INTO messages (sender_id, receiver_id, content)
-			VALUES ($1, $2, $3)
-			RETURNING id, sender_id, receiver_id, content, created_at
-		`,
-			currentID,
-			strconv.FormatInt(receiverID, 10),
-			input.Content,
-		).Scan(
-			&message.ID,
-			&message.SenderID,
-			&message.ReceiverID,
-			&message.Content,
-			&message.CreatedAt,
-		)
-		if err != nil {
-			log.Printf("Gagal menyimpan pesan: %v", err)
-			writeError(
-				w,
-				http.StatusInternalServerError,
-				"Gagal menyimpan pesan",
-			)
-			return
-		}
-
-		writeJSON(w, http.StatusCreated, message)
-
+		a.sendMessage(w, r, current)
 	default:
 		methodNotAllowed(w)
 	}
+}
+
+func (a *App) getMessages(
+	w http.ResponseWriter, r *http.Request, currentID string,
+) {
+	rows, err := a.db.QueryContext(r.Context(), `
+		SELECT id, sender_id, receiver_id, content, created_at
+		FROM messages
+		WHERE sender_id = $1 OR receiver_id = $1
+		ORDER BY created_at DESC, id DESC
+		LIMIT 500
+	`, currentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError,
+			"Gagal mengambil pesan")
+		return
+	}
+	defer rows.Close()
+
+	result := make([]Message, 0)
+
+	for rows.Next() {
+		var m Message
+		if err := rows.Scan(
+			&m.ID, &m.SenderID, &m.ReceiverID,
+			&m.Content, &m.CreatedAt,
+		); err != nil {
+			writeError(w, http.StatusInternalServerError,
+				"Gagal membaca pesan")
+			return
+		}
+		result = append(result, m)
+	}
+
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError,
+			"Gagal membaca pesan")
+		return
+	}
+
+	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
+		result[i], result[j] = result[j], result[i]
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (a *App) sendMessage(
+	w http.ResponseWriter, r *http.Request, current *User,
+) {
+	var input struct {
+		ReceiverID string `json:"receiver_id"`
+		Content    string `json:"content"`
+	}
+
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeError(w, http.StatusBadRequest, "JSON tidak valid")
+		return
+	}
+
+	input.ReceiverID = strings.TrimSpace(input.ReceiverID)
+	input.Content = strings.TrimSpace(input.Content)
+
+	receiverID, err := strconv.ParseInt(input.ReceiverID, 10, 64)
+	if err != nil || receiverID <= 0 ||
+		!validText(input.Content, 1, 4000) {
+		writeError(w, http.StatusBadRequest,
+			"Penerima atau pesan tidak valid")
+		return
+	}
+
+	if receiverID == current.ID {
+		writeError(w, http.StatusBadRequest,
+			"Tidak dapat mengirim pesan ke diri sendiri")
+		return
+	}
+
+	var message Message
+
+	// Validasi penerima aktif dan identitas pengirim
+	// dilakukan langsung melalui database.
+	err = a.db.QueryRowContext(r.Context(), `
+		INSERT INTO messages (sender_id, receiver_id, content)
+		SELECT sender.id::text, receiver.id::text, $3
+		FROM users sender
+		CROSS JOIN users receiver
+		WHERE sender.id = $1
+		  AND sender.is_active = TRUE
+		  AND receiver.id = $2
+		  AND receiver.is_active = TRUE
+		RETURNING id, sender_id, receiver_id, content, created_at
+	`, current.ID, receiverID, input.Content).Scan(
+		&message.ID,
+		&message.SenderID,
+		&message.ReceiverID,
+		&message.Content,
+		&message.CreatedAt,
+	)
+
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound,
+			"Pengirim atau penerima tidak aktif")
+		return
+	}
+
+	if err != nil {
+		log.Printf("Simpan pesan gagal: %v", err)
+		writeError(w, http.StatusInternalServerError,
+			"Gagal menyimpan pesan")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, message)
 }
 
 func (a *App) routes() http.Handler {
@@ -1024,43 +908,33 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/users", a.requireAuth(a.users))
 	mux.HandleFunc("/messages", a.requireAuth(a.messages))
 
-	const allowedOrigin = "https://ruangkita-697.pages.dev"
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Vary", "Origin")
 
 		origin := r.Header.Get("Origin")
+
 		if origin != "" && origin != allowedOrigin {
-			writeError(
-				w,
-				http.StatusForbidden,
-				"Origin tidak diizinkan",
-			)
+			writeError(w, http.StatusForbidden,
+				"Origin tidak diizinkan")
 			return
 		}
 
-		w.Header().Add("Vary", "Origin")
 		if origin == allowedOrigin {
 			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-			w.Header().Set(
-				"Access-Control-Allow-Headers",
-				"Authorization, Content-Type",
-			)
-			w.Header().Set(
-				"Access-Control-Allow-Methods",
-				"GET, POST, OPTIONS",
-			)
+			w.Header().Set("Access-Control-Allow-Headers",
+				"Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods",
+				"GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Max-Age", "600")
 		}
 
 		if r.Method == http.MethodOptions {
-			if origin != allowedOrigin || r.Header.Get("Access-Control-Request-Method") == "" {
-				writeError(w, http.StatusForbidden, "Preflight tidak diizinkan")
-				return
-			}
-			method := r.Header.Get("Access-Control-Request-Method")
-			if method != http.MethodGet && method != http.MethodPost {
-				writeError(w, http.StatusMethodNotAllowed, "Metode preflight tidak diizinkan")
+			if origin != allowedOrigin {
+				writeError(w, http.StatusForbidden,
+					"Preflight tidak diizinkan")
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -1087,20 +961,20 @@ func main() {
 	db.SetMaxIdleConns(2)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(
+		context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {
-		log.Fatal("Koneksi PostgreSQL gagal: ", err)
+		log.Fatal("Koneksi PostgreSQL gagal")
 	}
 
-	// Hash dummy dipakai saat username tidak ditemukan.
 	dummyHash, err := bcrypt.GenerateFromPassword(
 		[]byte("dummy-password-never-used"),
 		bcrypt.DefaultCost,
 	)
 	if err != nil {
-		log.Fatal("Gagal menyiapkan pemeriksaan login")
+		log.Fatal("Gagal menyiapkan autentikasi")
 	}
 
 	if err := bootstrapAdmin(db); err != nil {
@@ -1110,20 +984,23 @@ func main() {
 	app := &App{
 		db:        db,
 		dummyHash: dummyHash,
+		limiter:   newLoginLimiter(),
 	}
 
 	server := &http.Server{
 		Addr:              ":8088",
 		Handler:           app.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
-		MaxHeaderBytes:    16 << 10,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 
-	log.Println("RuangKita backend berjalan di port 8088")
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+	log.Println("RuangKita API siap di port 8088")
+
+	if err := server.ListenAndServe(); err != nil &&
+		!errors.Is(err, http.ErrServerClosed) {
+		log.Fatal("HTTP server gagal: ", err)
 	}
 }
