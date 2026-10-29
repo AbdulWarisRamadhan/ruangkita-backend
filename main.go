@@ -53,12 +53,58 @@ type contextKey string
 
 const userContextKey contextKey = "authenticated_user"
 
+
+type attemptRecord struct {
+	Count     int
+	WindowEnd time.Time
+}
+
 var loginAttempts = struct {
 	sync.Mutex
-	counts map[string]int
+	records map[string]attemptRecord
 }{
-	counts: make(map[string]int),
+	records: make(map[string]attemptRecord),
 }
+
+func loginBlocked(ip string) bool {
+	loginAttempts.Lock()
+	defer loginAttempts.Unlock()
+
+	now := time.Now()
+	record := loginAttempts.records[ip]
+
+	if now.After(record.WindowEnd) {
+		delete(loginAttempts.records, ip)
+		return false
+	}
+
+	return record.Count >= 10
+}
+
+func recordFailedLogin(ip string) {
+	loginAttempts.Lock()
+	defer loginAttempts.Unlock()
+
+	now := time.Now()
+	record := loginAttempts.records[ip]
+
+	if now.After(record.WindowEnd) || record.WindowEnd.IsZero() {
+		record = attemptRecord{
+			Count:     0,
+			WindowEnd: now.Add(15 * time.Minute),
+		}
+	}
+
+	record.Count++
+	loginAttempts.records[ip] = record
+}
+
+func clearLoginAttempts(ip string) {
+	loginAttempts.Lock()
+	defer loginAttempts.Unlock()
+	delete(loginAttempts.records, ip)
+}
+
 
 func jsonResponse(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
