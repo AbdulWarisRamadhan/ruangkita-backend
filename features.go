@@ -259,6 +259,112 @@ func (a *App) contactRespond(w http.ResponseWriter, r *http.Request, u *User) {
 	writeJSON(w, 200, map[string]string{"status": status})
 }
 
+func (a *App) adminContacts(w http.ResponseWriter, r *http.Request, u *User) {
+    if !u.IsAdmin {
+        writeError(w, 403, "Hanya admin")
+        return
+    }
+
+    switch r.Method {
+    case http.MethodGet:
+        userID, err := strconv.ParseInt(
+            r.URL.Query().Get("user_id"), 10, 64,
+        )
+        if err != nil || userID <= 0 {
+            writeError(w, 400, "ID pengguna tidak valid")
+            return
+        }
+
+        rows, err := a.db.QueryContext(
+            r.Context(),
+            `SELECT u.id, u.username, u.display_name, u.is_admin
+             FROM contacts c
+             JOIN users u ON u.id = CASE
+                 WHEN c.user_low = $1::BIGINT
+                 THEN c.user_high
+                 ELSE c.user_low
+             END
+             WHERE c.user_low = $1::BIGINT
+                OR c.user_high = $1::BIGINT
+             ORDER BY u.display_name`,
+            userID,
+        )
+        if err != nil {
+            log.Printf("ERROR adminContacts GET: %v", err)
+            writeError(w, 500, "Gagal mengambil kontak")
+            return
+        }
+        defer rows.Close()
+
+        result := make([]User, 0)
+        for rows.Next() {
+            var item User
+            if err := rows.Scan(
+                &item.ID,
+                &item.Username,
+                &item.DisplayName,
+                &item.IsAdmin,
+            ); err != nil {
+                writeError(w, 500, "Gagal membaca kontak")
+                return
+            }
+            result = append(result, item)
+        }
+
+        if err := rows.Err(); err != nil {
+            writeError(w, 500, "Gagal membaca kontak")
+            return
+        }
+
+        writeJSON(w, 200, result)
+
+    case http.MethodPost:
+        var input struct {
+            UserID    int64 `json:"user_id"`
+            ContactID int64 `json:"contact_id"`
+        }
+
+        if decodeJSON(w, r, &input) != nil ||
+            input.UserID <= 0 ||
+            input.ContactID <= 0 ||
+            input.UserID == input.ContactID {
+            writeError(w, 400, "Data kontak tidak valid")
+            return
+        }
+
+        result, err := a.db.ExecContext(
+            r.Context(),
+            `DELETE FROM contacts
+             WHERE user_low = LEAST($1::BIGINT, $2::BIGINT)
+               AND user_high = GREATEST($1::BIGINT, $2::BIGINT)`,
+            input.UserID,
+            input.ContactID,
+        )
+        if err != nil {
+            log.Printf("ERROR adminContacts DELETE: %v", err)
+            writeError(w, 500, "Gagal menghapus kontak")
+            return
+        }
+
+        affected, err := result.RowsAffected()
+        if err != nil {
+            writeError(w, 500, "Gagal memeriksa penghapusan")
+            return
+        }
+        if affected == 0 {
+            writeError(w, 404, "Hubungan kontak tidak ditemukan")
+            return
+        }
+
+        writeJSON(w, 200, map[string]string{
+            "message": "Kontak berhasil dihapus oleh admin",
+        })
+
+    default:
+        methodNotAllowed(w)
+    }
+}
+
 func (a *App) contactRemove(w http.ResponseWriter, r *http.Request, u *User) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
