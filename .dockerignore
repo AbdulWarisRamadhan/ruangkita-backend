@@ -1,0 +1,9 @@
+
+.git
+.github
+.env
+.env.*
+!.env.example
+*.log
+coverage.out
+ruangkita-backend
