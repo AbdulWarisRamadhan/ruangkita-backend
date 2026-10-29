@@ -1203,6 +1203,10 @@ func main() {
 		log.Fatal("Koneksi PostgreSQL gagal")
 	}
 
+	if err := runMigrations(db); err != nil {
+		log.Fatal("Migrasi database gagal: ", err)
+	}
+
 	dummyHash, err := bcrypt.GenerateFromPassword(
 		[]byte("dummy-password-never-used"),
 		bcrypt.DefaultCost,
