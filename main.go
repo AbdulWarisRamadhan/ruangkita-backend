@@ -1137,6 +1137,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/contacts/respond", a.requireAuth(a.contactRespond))
 	mux.HandleFunc("/contacts/remove", a.requireAuth(a.contactRemove))
 	mux.HandleFunc("/admin/users", a.requireAuth(a.adminUsers))
+	mux.HandleFunc("/admin/contacts", a.requireAuth(a.adminContacts))
 	mux.HandleFunc("/media/upload", a.requireAuth(a.mediaUpload))
 	mux.HandleFunc("/media", a.requireAuth(a.mediaList))
 	mux.HandleFunc("/media/file/", a.requireAuth(a.mediaGet))
