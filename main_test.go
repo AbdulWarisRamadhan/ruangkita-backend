@@ -49,8 +49,9 @@ func TestBearerToken(t *testing.T) {
 	}
 
 	req.Header.Set("Authorization", "Bearer invalid")
+
 	if _, err := bearerToken(req); err == nil {
-		t.Fatal("Token invalid diterima")
+		t.Fatal("Token tidak valid diterima")
 	}
 }
 
@@ -58,9 +59,11 @@ func TestValidText(t *testing.T) {
 	if !validText("Halo", 1, 10) {
 		t.Fatal("Teks valid ditolak")
 	}
+
 	if validText("   ", 1, 10) {
 		t.Fatal("Teks kosong diterima")
 	}
+
 	if !validText("你好", 2, 2) {
 		t.Fatal("Unicode valid ditolak")
 	}
@@ -70,9 +73,11 @@ func TestValidPassword(t *testing.T) {
 	if validPassword("pendek") {
 		t.Fatal("Password pendek diterima")
 	}
+
 	if !validPassword("PasswordAman12345") {
 		t.Fatal("Password valid ditolak")
 	}
+
 	if validPassword(strings.Repeat("x", 73)) {
 		t.Fatal("Password terlalu panjang diterima")
 	}
@@ -84,9 +89,11 @@ func TestDecodeJSON(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodPost, "/test",
+		http.MethodPost,
+		"/test",
 		bytes.NewBufferString(`{"name":"Alin"}`),
 	)
+
 	w := httptest.NewRecorder()
 
 	if err := decodeJSON(w, req, &input); err != nil {
@@ -104,9 +111,11 @@ func TestDecodeJSONRejectUnknownField(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(
-		http.MethodPost, "/test",
+		http.MethodPost,
+		"/test",
 		bytes.NewBufferString(`{"name":"Alin","admin":true}`),
 	)
+
 	w := httptest.NewRecorder()
 
 	if err := decodeJSON(w, req, &input); err == nil {
@@ -129,15 +138,20 @@ func TestLoginLimiter(t *testing.T) {
 	limiter.clear(ip)
 
 	if limiter.blocked(ip) {
-		t.Fatal("Rate limiter gagal reset")
+		t.Fatal("Rate limiter gagal direset")
 	}
 }
 
 func TestHealthMethodNotAllowed(t *testing.T) {
 	app := &App{}
-	req := httptest.NewRequest(http.MethodPost, "/health", nil)
-	w := httptest.NewRecorder()
 
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/health",
+		nil,
+	)
+
+	w := httptest.NewRecorder()
 	app.health(w, req)
 
 	if w.Code != http.StatusMethodNotAllowed {
@@ -150,7 +164,9 @@ func TestCORS(t *testing.T) {
 	handler := app.routes()
 
 	req := httptest.NewRequest(
-		http.MethodOptions, "/login", nil,
+		http.MethodOptions,
+		"/login",
+		nil,
 	)
 	req.Header.Set("Origin", allowedOrigin)
 
@@ -166,7 +182,9 @@ func TestCORS(t *testing.T) {
 	}
 
 	req2 := httptest.NewRequest(
-		http.MethodOptions, "/login", nil,
+		http.MethodOptions,
+		"/login",
+		nil,
 	)
 	req2.Header.Set("Origin", "https://evil.example")
 
@@ -180,10 +198,19 @@ func TestCORS(t *testing.T) {
 
 func TestJSONError(t *testing.T) {
 	w := httptest.NewRecorder()
-	writeError(w, http.StatusBadRequest, "Kesalahan")
+
+	writeError(
+		w,
+		http.StatusBadRequest,
+		"Kesalahan",
+	)
 
 	var result map[string]string
-	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+
+	if err := json.Unmarshal(
+		w.Body.Bytes(),
+		&result,
+	); err != nil {
 		t.Fatal(err)
 	}
 
