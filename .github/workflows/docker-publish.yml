@@ -19,6 +19,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+
+      - name: Generate go.sum
+        run: go mod tidy
+
+      - name: Test backend
+        run: go test ./...
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
