@@ -40,6 +40,13 @@ func isAllowedOrigin(origin string) bool {
 	if origin == allowedOrigin || origin == "https://ruangkita-v3-test.pages.dev" {
 		return true
 	}
+	// Explicit developer-controlled preview origins; never wildcard production origins.
+	for _, candidate := range strings.Split(os.Getenv("V4_ALLOWED_ORIGINS"), ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate != "" && origin == candidate {
+			return true
+		}
+	}
 	const prefix = "https://"
 	const suffix = ".ruangkita-v3-test.pages.dev"
 	if !strings.HasPrefix(origin, prefix) || !strings.HasSuffix(origin, suffix) {
@@ -67,17 +74,23 @@ type User struct {
 }
 
 type Message struct {
-	ID         int64     `json:"id"`
-	SenderID   string    `json:"sender_id"`
-	ReceiverID string    `json:"receiver_id"`
-	Content    string    `json:"content"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID                 int64      `json:"id"`
+	SenderID           string     `json:"sender_id"`
+	ReceiverID         string     `json:"receiver_id"`
+	Content            string     `json:"content"`
+	CreatedAt          time.Time  `json:"created_at"`
+	ReplyToMessageID   *int64     `json:"reply_to_message_id"`
+	ReplyContent       *string    `json:"reply_content"`
+	DeletedForEveryone bool       `json:"deleted_for_everyone"`
+	ReadAt             *time.Time `json:"read_at,omitempty"`
 }
 
 type App struct {
-	db        *sql.DB
-	dummyHash []byte
-	limiter   *LoginLimiter
+	db         *sql.DB
+	dummyHash  []byte
+	limiter    *LoginLimiter
+	push       *pushConfig
+	pushSender pushSendFunc
 }
 
 type attemptRecord struct {
@@ -770,45 +783,51 @@ func (a *App) getMessages(
 	w http.ResponseWriter, r *http.Request, currentID string,
 ) {
 	rows, err := a.db.QueryContext(r.Context(), `
-		SELECT id, sender_id, receiver_id, content, created_at
-		FROM messages
-		WHERE (sender_id = $1 OR receiver_id = $1)
-          AND EXISTS (SELECT 1 FROM contacts c WHERE c.user_low=LEAST(sender_id::BIGINT,receiver_id::BIGINT) AND c.user_high=GREATEST(sender_id::BIGINT,receiver_id::BIGINT))
-		ORDER BY created_at DESC, id DESC
+		SELECT m.id, m.sender_id, m.receiver_id, m.content, m.created_at,
+		       m.reply_to_message_id, CASE WHEN original.deleted_for_everyone THEN NULL ELSE original.content END, m.deleted_for_everyone, mr.read_at
+		FROM messages m
+		LEFT JOIN messages original ON original.id = m.reply_to_message_id
+		LEFT JOIN message_reads mr ON mr.message_id = m.id AND mr.reader_id::TEXT = m.receiver_id
+		WHERE (m.sender_id = $1 OR m.receiver_id = $1)
+		  AND NOT EXISTS (SELECT 1 FROM hidden_messages h WHERE h.message_id=m.id AND h.user_id::TEXT=$1)
+          AND m.created_at > COALESCE((SELECT cc.cleared_at FROM conversation_clears cc WHERE cc.user_id::TEXT=$1 AND cc.peer_id::TEXT=CASE WHEN m.sender_id=$1 THEN m.receiver_id ELSE m.sender_id END),'-infinity'::TIMESTAMPTZ)
+          AND EXISTS (
+		    SELECT 1 FROM contacts c
+		    WHERE c.user_low = LEAST(m.sender_id::BIGINT, m.receiver_id::BIGINT)
+		      AND c.user_high = GREATEST(m.sender_id::BIGINT, m.receiver_id::BIGINT)
+		  )
+		ORDER BY m.created_at DESC, m.id DESC
 		LIMIT 500
 	`, currentID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError,
-			"Gagal mengambil pesan")
+		writeError(w, http.StatusInternalServerError, "Gagal mengambil pesan")
 		return
 	}
 	defer rows.Close()
 
 	result := make([]Message, 0)
-
 	for rows.Next() {
 		var m Message
 		if err := rows.Scan(
-			&m.ID, &m.SenderID, &m.ReceiverID,
-			&m.Content, &m.CreatedAt,
+			&m.ID, &m.SenderID, &m.ReceiverID, &m.Content,
+			&m.CreatedAt, &m.ReplyToMessageID, &m.ReplyContent,
+			&m.DeletedForEveryone, &m.ReadAt,
 		); err != nil {
-			writeError(w, http.StatusInternalServerError,
-				"Gagal membaca pesan")
+			writeError(w, http.StatusInternalServerError, "Gagal membaca pesan")
 			return
+		}
+		if m.DeletedForEveryone {
+			m.Content = "Pesan ini telah dihapus"
 		}
 		result = append(result, m)
 	}
-
 	if err := rows.Err(); err != nil {
-		writeError(w, http.StatusInternalServerError,
-			"Gagal membaca pesan")
+		writeError(w, http.StatusInternalServerError, "Gagal membaca pesan")
 		return
 	}
-
 	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
 		result[i], result[j] = result[j], result[i]
 	}
-
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -816,76 +835,109 @@ func (a *App) sendMessage(
 	w http.ResponseWriter, r *http.Request, current *User,
 ) {
 	var input struct {
-		ReceiverID string `json:"receiver_id"`
-		Content    string `json:"content"`
+		ReceiverID       string `json:"receiver_id"`
+		Content          string `json:"content"`
+		ReplyToMessageID *int64 `json:"reply_to_message_id"`
 	}
-
 	if err := decodeJSON(w, r, &input); err != nil {
 		writeError(w, http.StatusBadRequest, "JSON tidak valid")
 		return
 	}
-
 	input.ReceiverID = strings.TrimSpace(input.ReceiverID)
 	input.Content = strings.TrimSpace(input.Content)
-
 	receiverID, err := strconv.ParseInt(input.ReceiverID, 10, 64)
-	if err != nil || receiverID <= 0 ||
-		!validText(input.Content, 1, 4000) {
-		writeError(w, http.StatusBadRequest,
-			"Penerima atau pesan tidak valid")
+	if err != nil || receiverID <= 0 || !validText(input.Content, 1, 4000) {
+		writeError(w, http.StatusBadRequest, "Penerima atau pesan tidak valid")
 		return
 	}
-
 	if receiverID == current.ID {
-		writeError(w, http.StatusBadRequest,
-			"Tidak dapat mengirim pesan ke diri sendiri")
+		writeError(w, http.StatusBadRequest, "Tidak dapat mengirim pesan ke diri sendiri")
+		return
+	}
+	if input.ReplyToMessageID != nil && *input.ReplyToMessageID <= 0 {
+		writeError(w, http.StatusBadRequest, "ID pesan balasan tidak valid")
 		return
 	}
 
 	allowed, checkErr := a.areContacts(r, current.ID, receiverID)
 	if checkErr != nil {
-		writeError(w, 500, "Gagal memeriksa kontak")
+		writeError(w, http.StatusInternalServerError, "Gagal memeriksa kontak")
 		return
 	}
 	if !allowed {
-		writeError(w, 403, "Tambahkan dan setujui kontak sebelum mengirim pesan")
+		writeError(w, http.StatusForbidden, "Tambahkan dan setujui kontak sebelum mengirim pesan")
 		return
 	}
-	var message Message
 
-	// Validasi penerima aktif dan identitas pengirim
-	// dilakukan langsung melalui database.
+	// Hanya pesan teks dari percakapan dua peserta yang sama boleh dibalas.
+	// Media belum memiliki ID pada tabel messages.
+	if input.ReplyToMessageID != nil {
+		var exists bool
+		err = a.db.QueryRowContext(r.Context(), `
+			SELECT EXISTS (
+				SELECT 1 FROM messages
+				WHERE id = $1
+				  AND (
+				    (sender_id = $2 AND receiver_id = $3)
+				    OR (sender_id = $3 AND receiver_id = $2)
+				  )
+			)
+		`, *input.ReplyToMessageID, strconv.FormatInt(current.ID, 10),
+			strconv.FormatInt(receiverID, 10)).Scan(&exists)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Gagal memeriksa pesan balasan")
+			return
+		}
+		if !exists {
+			writeError(w, http.StatusBadRequest, "Pesan yang dibalas tidak ada dalam percakapan ini")
+			return
+		}
+	}
+
+	var message Message
+	// Pemeriksaan EXISTS di INSERT menjaga validasi reply tetap berlaku
+	// pada saat pesan benar-benar disimpan.
 	err = a.db.QueryRowContext(r.Context(), `
-		INSERT INTO messages (sender_id, receiver_id, content)
-		SELECT sender.id::text, receiver.id::text, $3
+		INSERT INTO messages (sender_id, receiver_id, content, reply_to_message_id)
+		SELECT sender.id::text, receiver.id::text, $3, $4
 		FROM users sender
 		CROSS JOIN users receiver
 		WHERE sender.id = $1
 		  AND sender.is_active = TRUE
 		  AND receiver.id = $2
 		  AND receiver.is_active = TRUE
-		RETURNING id, sender_id, receiver_id, content, created_at
-	`, current.ID, receiverID, input.Content).Scan(
-		&message.ID,
-		&message.SenderID,
-		&message.ReceiverID,
-		&message.Content,
-		&message.CreatedAt,
+		  AND (
+		    $4::BIGINT IS NULL OR EXISTS (
+		      SELECT 1 FROM messages original
+		      WHERE original.id = $4
+		        AND (
+		          (original.sender_id = sender.id::text AND original.receiver_id = receiver.id::text)
+		          OR (original.sender_id = receiver.id::text AND original.receiver_id = sender.id::text)
+		        )
+		    )
+		  )
+		RETURNING id, sender_id, receiver_id, content, created_at, reply_to_message_id
+	`, current.ID, receiverID, input.Content, input.ReplyToMessageID).Scan(
+		&message.ID, &message.SenderID, &message.ReceiverID,
+		&message.Content, &message.CreatedAt, &message.ReplyToMessageID,
 	)
-
 	if errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusNotFound,
-			"Pengirim atau penerima tidak aktif")
+		writeError(w, http.StatusNotFound, "Pengirim, penerima, atau pesan balasan tidak tersedia")
 		return
 	}
-
 	if err != nil {
 		log.Printf("Simpan pesan gagal: %v", err)
-		writeError(w, http.StatusInternalServerError,
-			"Gagal menyimpan pesan")
+		writeError(w, http.StatusInternalServerError, "Gagal menyimpan pesan")
 		return
 	}
-
+	if message.ReplyToMessageID != nil {
+		var content string
+		if err := a.db.QueryRowContext(r.Context(),
+			`SELECT content FROM messages WHERE id = $1`,
+			*message.ReplyToMessageID).Scan(&content); err == nil {
+			message.ReplyContent = &content
+		}
+	}
 	writeJSON(w, http.StatusCreated, message)
 }
 
@@ -1125,6 +1177,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/login", a.login)
 	mux.HandleFunc("/me", a.requireAuth(a.me))
 	mux.HandleFunc("/logout", a.requireAuth(a.logout))
+	mux.HandleFunc("/v4/push/key", a.requireAuth(a.pushKey))
+	mux.HandleFunc("/v4/push/subscription", a.requireAuth(a.pushSubscription))
 	mux.HandleFunc("/register", a.requireAuth(a.register))
 	mux.HandleFunc("/change-password", a.requireAuth(a.changePassword))
 	mux.HandleFunc("/users", a.requireAuth(a.users))
@@ -1141,6 +1195,16 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("/media/upload", a.requireAuth(a.mediaUpload))
 	mux.HandleFunc("/media", a.requireAuth(a.mediaList))
 	mux.HandleFunc("/media/file/", a.requireAuth(a.mediaGet))
+	mux.HandleFunc("/v4/messages/", a.requireAuth(a.deleteMessageV4))
+	mux.HandleFunc("/v4/media/", a.requireAuth(a.deleteMediaV4))
+	mux.HandleFunc("/v4/chats/clear", a.requireAuth(a.clearChatV4))
+	mux.HandleFunc("/v4/chats/read", a.requireAuth(a.readChatV4))
+	mux.HandleFunc("/v4/presence", a.requireAuth(a.presenceV4))
+	mux.HandleFunc("/v4/invites", a.requireAuth(a.invitesV4))
+	mux.HandleFunc("/v4/invites/accept", a.requireAuth(a.acceptInviteV4))
+	mux.HandleFunc("/v4/stickers", a.requireAuth(a.stickersV4))
+	mux.HandleFunc("/v4/stickers/send", a.requireAuth(a.sendStickerV4))
+	mux.HandleFunc("/v4/admin/media", a.requireAuth(a.adminMediaV4))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -1161,7 +1225,7 @@ func (a *App) routes() http.Handler {
 			w.Header().Set("Access-Control-Allow-Headers",
 				"Authorization, Content-Type")
 			w.Header().Set("Access-Control-Allow-Methods",
-				"GET, POST, OPTIONS")
+				"GET, POST, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Max-Age", "600")
 		}
 
@@ -1180,6 +1244,10 @@ func (a *App) routes() http.Handler {
 }
 
 func main() {
+	// Paket ini hanya untuk staging baru; jangan arahkan ke DB V3 atau V4 aktif.
+	if strings.TrimSpace(os.Getenv("DB_NAME")) != "ruangkita_v4_webpush_test" {
+		log.Fatal("Paket staging: DB_NAME harus ruangkita_v4_webpush_test; V3/V4 aktif tidak boleh diubah")
+	}
 	dsn, err := databaseDSN()
 	if err != nil {
 		log.Fatal("Konfigurasi database tidak valid: ", err)
@@ -1227,12 +1295,16 @@ func main() {
 		db:        db,
 		dummyHash: dummyHash,
 		limiter:   newLoginLimiter(),
+		push:      loadPushConfig(),
 	}
 
 	if err := app.ensureFeatures(); err != nil {
 		log.Fatal("Gagal menyiapkan fitur baru: ", err)
 	}
 	app.startMediaCleanup()
+	pushCtx, stopPush := context.WithCancel(context.Background())
+	defer stopPush()
+	app.startPushWorker(pushCtx)
 	server := &http.Server{
 		Addr:              ":8088",
 		Handler:           app.routes(),

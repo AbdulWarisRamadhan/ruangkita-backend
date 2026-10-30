@@ -61,10 +61,10 @@ func runMigrations(db *sql.DB) error {
 	}()
 
 	_, err = conn.ExecContext(ctx, `
-	CREATE TABLE IF NOT EXISTS schema_migrations (
-		version VARCHAR(100) PRIMARY KEY,
-				  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version VARCHAR(100) PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
 	`)
 	if err != nil {
 		return fmt.Errorf("menyiapkan schema_migrations: %w", err)
@@ -94,7 +94,6 @@ func runMigrations(db *sql.DB) error {
 			return fmt.Errorf("memeriksa migrasi %s: %w", version, err)
 		}
 		if applied {
-
 			log.Printf("Migrasi %s sudah diterapkan", version)
 			continue
 		}
@@ -103,7 +102,6 @@ func runMigrations(db *sql.DB) error {
 		if err != nil {
 			return fmt.Errorf("membaca %s: %w", filename, err)
 		}
-
 		statement, err := migrationSQL(string(data))
 		if err != nil {
 			return fmt.Errorf("memproses %s: %w", filename, err)
@@ -113,26 +111,20 @@ func runMigrations(db *sql.DB) error {
 		if err != nil {
 			return fmt.Errorf("memulai transaksi %s: %w", version, err)
 		}
-
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("menjalankan migrasi %s: %w", version, err)
 		}
-
 		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO schema_migrations (version) VALUES ($1)",
-			version,
+			"INSERT INTO schema_migrations (version) VALUES ($1)", version,
 		); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("mencatat migrasi %s: %w", version, err)
 		}
-
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit migrasi %s: %w", version, err)
 		}
-
 		log.Printf("Migrasi %s berhasil", version)
 	}
-
 	return nil
 }

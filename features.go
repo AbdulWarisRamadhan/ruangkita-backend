@@ -57,21 +57,9 @@ func (a *App) ensureFeatures() error {
 }
 
 func (a *App) areContacts(r *http.Request, left, right int64) (bool, error) {
-    var ok bool
-
-    err := a.db.QueryRowContext(
-        r.Context(),
-        `SELECT EXISTS(
-            SELECT 1
-            FROM contacts
-            WHERE user_low = LEAST($1::BIGINT, $2::BIGINT)
-              AND user_high = GREATEST($1::BIGINT, $2::BIGINT)
-        )`,
-        left,
-        right,
-    ).Scan(&ok)
-
-    return ok, err
+	var ok bool
+	err := a.db.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM contacts WHERE user_low=LEAST($1,$2) AND user_high=GREATEST($1,$2))`, left, right).Scan(&ok)
+	return ok, err
 }
 
 func (a *App) contacts(w http.ResponseWriter, r *http.Request, u *User) {
@@ -180,9 +168,8 @@ func (a *App) contactRequests(w http.ResponseWriter, r *http.Request, u *User) {
 		}
 		exists, err := a.areContacts(r, u.ID, receiver)
 		if err != nil {
-    		log.Printf("ERROR contactRequests areContacts: %v", err)
-   			writeError(w, 500, "Gagal memeriksa kontak")
-   			return
+			writeError(w, 500, "Gagal memeriksa kontak")
+			return
 		}
 		if exists {
 			writeError(w, 409, "Sudah menjadi kontak")
@@ -230,24 +217,12 @@ func (a *App) contactRespond(w http.ResponseWriter, r *http.Request, u *User) {
 	}
 	status := "rejected"
 	if input.Accept {
-    status = "accepted"
-
-    if _, err = tx.ExecContext(
-        r.Context(),
-        `INSERT INTO contacts(user_low, user_high)
-         VALUES(
-             LEAST($1::BIGINT, $2::BIGINT),
-             GREATEST($1::BIGINT, $2::BIGINT)
-         )
-         ON CONFLICT DO NOTHING`,
-        sender,
-        u.ID,
-    ); err != nil {
-        log.Printf("ERROR contactRespond INSERT contacts: %v", err)
-        writeError(w, 500, "Gagal menambah kontak")
-        return
-    }
-}
+		status = "accepted"
+		if _, err = tx.ExecContext(r.Context(), `INSERT INTO contacts(user_low,user_high) VALUES(LEAST($1,$2),GREATEST($1,$2)) ON CONFLICT DO NOTHING`, sender, u.ID); err != nil {
+			writeError(w, 500, "Gagal menambah kontak")
+			return
+		}
+	}
 	if _, err = tx.ExecContext(r.Context(), `UPDATE contact_requests SET status=$1 WHERE id=$2`, status, input.RequestID); err != nil {
 		writeError(w, 500, "Gagal menyimpan permintaan")
 		return
@@ -257,112 +232,6 @@ func (a *App) contactRespond(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": status})
-}
-
-func (a *App) adminContacts(w http.ResponseWriter, r *http.Request, u *User) {
-    if !u.IsAdmin {
-        writeError(w, 403, "Hanya admin")
-        return
-    }
-
-    switch r.Method {
-    case http.MethodGet:
-        userID, err := strconv.ParseInt(
-            r.URL.Query().Get("user_id"), 10, 64,
-        )
-        if err != nil || userID <= 0 {
-            writeError(w, 400, "ID pengguna tidak valid")
-            return
-        }
-
-        rows, err := a.db.QueryContext(
-            r.Context(),
-            `SELECT u.id, u.username, u.display_name, u.is_admin
-             FROM contacts c
-             JOIN users u ON u.id = CASE
-                 WHEN c.user_low = $1::BIGINT
-                 THEN c.user_high
-                 ELSE c.user_low
-             END
-             WHERE c.user_low = $1::BIGINT
-                OR c.user_high = $1::BIGINT
-             ORDER BY u.display_name`,
-            userID,
-        )
-        if err != nil {
-            log.Printf("ERROR adminContacts GET: %v", err)
-            writeError(w, 500, "Gagal mengambil kontak")
-            return
-        }
-        defer rows.Close()
-
-        result := make([]User, 0)
-        for rows.Next() {
-            var item User
-            if err := rows.Scan(
-                &item.ID,
-                &item.Username,
-                &item.DisplayName,
-                &item.IsAdmin,
-            ); err != nil {
-                writeError(w, 500, "Gagal membaca kontak")
-                return
-            }
-            result = append(result, item)
-        }
-
-        if err := rows.Err(); err != nil {
-            writeError(w, 500, "Gagal membaca kontak")
-            return
-        }
-
-        writeJSON(w, 200, result)
-
-    case http.MethodPost:
-        var input struct {
-            UserID    int64 `json:"user_id"`
-            ContactID int64 `json:"contact_id"`
-        }
-
-        if decodeJSON(w, r, &input) != nil ||
-            input.UserID <= 0 ||
-            input.ContactID <= 0 ||
-            input.UserID == input.ContactID {
-            writeError(w, 400, "Data kontak tidak valid")
-            return
-        }
-
-        result, err := a.db.ExecContext(
-            r.Context(),
-            `DELETE FROM contacts
-             WHERE user_low = LEAST($1::BIGINT, $2::BIGINT)
-               AND user_high = GREATEST($1::BIGINT, $2::BIGINT)`,
-            input.UserID,
-            input.ContactID,
-        )
-        if err != nil {
-            log.Printf("ERROR adminContacts DELETE: %v", err)
-            writeError(w, 500, "Gagal menghapus kontak")
-            return
-        }
-
-        affected, err := result.RowsAffected()
-        if err != nil {
-            writeError(w, 500, "Gagal memeriksa penghapusan")
-            return
-        }
-        if affected == 0 {
-            writeError(w, 404, "Hubungan kontak tidak ditemukan")
-            return
-        }
-
-        writeJSON(w, 200, map[string]string{
-            "message": "Kontak berhasil dihapus oleh admin",
-        })
-
-    default:
-        methodNotAllowed(w)
-    }
 }
 
 func (a *App) contactRemove(w http.ResponseWriter, r *http.Request, u *User) {
@@ -406,12 +275,23 @@ func (a *App) mediaUpload(w http.ResponseWriter, r *http.Request, u *User) {
 	if r.MultipartForm != nil {
 		defer r.MultipartForm.RemoveAll()
 	}
+	kind := r.FormValue("kind")
+	if kind == "" {
+		kind = "media"
+	}
+	if kind != "media" && kind != "voice" && kind != "sticker" {
+		writeError(w, 400, "Jenis media tidak valid")
+		return
+	}
 	receiver, err := strconv.ParseInt(r.FormValue("receiver_id"), 10, 64)
-	if err != nil || receiver <= 0 || receiver == u.ID {
+	if err != nil || receiver <= 0 || (receiver == u.ID && kind != "sticker") || (kind == "sticker" && receiver != u.ID) {
 		writeError(w, 400, "Penerima tidak valid")
 		return
 	}
-	ok, err := a.areContacts(r, u.ID, receiver)
+	ok := true
+	if kind != "sticker" {
+		ok, err = a.areContacts(r, u.ID, receiver)
+	}
 	if err != nil {
 		writeError(w, 500, "Gagal memeriksa kontak")
 		return
@@ -437,12 +317,34 @@ func (a *App) mediaUpload(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	mime := http.DetectContentType(buf[:n])
-	allowed := strings.HasPrefix(mime, "image/") || strings.HasPrefix(mime, "video/") || mime == "application/pdf" || mime == "text/plain" || mime == "application/zip" || mime == "application/octet-stream"
+	allowed := strings.HasPrefix(mime, "image/") || strings.HasPrefix(mime, "video/") || mime == "application/pdf" || mime == "text/plain" || mime == "application/zip" || mime == "application/octet-stream" || strings.HasPrefix(mime, "audio/") || mime == "application/ogg" || mime == "audio/mp4"
 	if !allowed || strings.Contains(mime, "svg") || mime == "text/html" {
 		writeError(w, 415, "Jenis file tidak didukung")
 		return
 	}
+	if kind == "voice" {
+		// Browser-generated MediaRecorder blobs may be detected as octet-stream.
+		name := strings.ToLower(header.Filename)
+		voiceMime := strings.HasPrefix(mime, "audio/") || mime == "application/ogg" || ((strings.HasSuffix(name, ".webm") || strings.HasSuffix(name, ".ogg") || strings.HasSuffix(name, ".m4a")) && (mime == "video/webm" || mime == "application/octet-stream"))
+		if !voiceMime {
+			writeError(w, 415, "Voice note harus berupa audio")
+			return
+		}
+		if mime == "application/octet-stream" || mime == "video/webm" {
+			mime = "audio/webm"
+		} else if mime == "application/ogg" {
+			mime = "audio/ogg"
+		}
+	}
+	if kind == "sticker" && (!strings.HasPrefix(mime, "image/") || mime == "image/svg+xml" || header.Size > 2<<20) {
+		writeError(w, 415, "Stiker harus gambar maksimal 2 MB")
+		return
+	}
 	viewOnce := r.FormValue("view_once") == "true"
+	if viewOnce && kind != "media" {
+		writeError(w, 400, "Lihat sekali hanya untuk foto atau video")
+		return
+	}
 	if viewOnce && !strings.HasPrefix(mime, "image/") && !strings.HasPrefix(mime, "video/") {
 		writeError(w, 400, "Lihat sekali hanya untuk foto atau video")
 		return
@@ -477,13 +379,20 @@ func (a *App) mediaUpload(w http.ResponseWriter, r *http.Request, u *User) {
 	if name == "" {
 		name = "file"
 	}
-	_, err = a.db.ExecContext(r.Context(), `INSERT INTO media_files(id,sender_id,receiver_id,original_name,mime_type,size_bytes,view_once) VALUES($1,$2,$3,$4,$5,$6,$7)`, id, u.ID, receiver, name, mime, count, viewOnce)
+	expiry := "24 hours"
+	if kind == "voice" || kind == "sticker" {
+		expiry = "100 years"
+	}
+	_, err = a.db.ExecContext(r.Context(), `INSERT INTO media_files(id,sender_id,receiver_id,original_name,mime_type,size_bytes,view_once,kind,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,NOW()+($9::TEXT)::INTERVAL)`, id, u.ID, receiver, name, mime, count, viewOnce, kind, expiry)
+	if err == nil && kind == "sticker" {
+		_, err = a.db.ExecContext(r.Context(), `INSERT INTO sticker_library(owner_id,media_id) VALUES($1,$2)`, u.ID, id)
+	}
 	if err != nil {
 		os.Remove(mediaPath(id))
 		writeError(w, 500, "Gagal menyimpan informasi media")
 		return
 	}
-	writeJSON(w, 201, map[string]any{"id": id, "receiver_id": receiver, "name": name, "mime_type": mime, "size_bytes": count, "view_once": viewOnce, "expires_in": 86400})
+	writeJSON(w, 201, map[string]any{"id": id, "receiver_id": receiver, "name": name, "mime_type": mime, "size_bytes": count, "view_once": viewOnce, "kind": kind, "expires_in": map[bool]int{true: 86400, false: 0}[kind == "media"]})
 }
 
 func (a *App) mediaList(w http.ResponseWriter, r *http.Request, u *User) {
@@ -491,7 +400,7 @@ func (a *App) mediaList(w http.ResponseWriter, r *http.Request, u *User) {
 		methodNotAllowed(w)
 		return
 	}
-	rows, err := a.db.QueryContext(r.Context(), `SELECT id,sender_id,receiver_id,original_name,mime_type,size_bytes,view_once,viewed_at,created_at,expires_at FROM media_files WHERE (sender_id=$1 OR receiver_id=$1) AND expires_at>NOW() AND EXISTS(SELECT 1 FROM contacts WHERE user_low=LEAST(sender_id,receiver_id) AND user_high=GREATEST(sender_id,receiver_id)) ORDER BY created_at DESC LIMIT 300`, u.ID)
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id,sender_id,receiver_id,original_name,mime_type,size_bytes,view_once,viewed_at,created_at,expires_at,kind FROM media_files WHERE (sender_id=$1 OR receiver_id=$1) AND sender_id<>receiver_id AND deleted_for_everyone=FALSE AND NOT EXISTS(SELECT 1 FROM hidden_media h WHERE h.media_id=media_files.id AND h.user_id=$1) AND expires_at>NOW() AND created_at>COALESCE((SELECT cleared_at FROM conversation_clears WHERE user_id=$1 AND peer_id=CASE WHEN sender_id=$1 THEN receiver_id ELSE sender_id END),'-infinity'::TIMESTAMPTZ) AND EXISTS(SELECT 1 FROM contacts WHERE user_low=LEAST(sender_id,receiver_id) AND user_high=GREATEST(sender_id,receiver_id)) ORDER BY created_at DESC LIMIT 300`, u.ID)
 	if err != nil {
 		writeError(w, 500, "Gagal membaca media")
 		return
@@ -508,11 +417,12 @@ func (a *App) mediaList(w http.ResponseWriter, r *http.Request, u *User) {
 		ViewedAt   *time.Time `json:"viewed_at"`
 		CreatedAt  time.Time  `json:"created_at"`
 		ExpiresAt  time.Time  `json:"expires_at"`
+		Kind       string     `json:"kind"`
 	}
 	result := make([]item, 0)
 	for rows.Next() {
 		var v item
-		if err := rows.Scan(&v.ID, &v.SenderID, &v.ReceiverID, &v.Name, &v.MimeType, &v.Size, &v.ViewOnce, &v.ViewedAt, &v.CreatedAt, &v.ExpiresAt); err != nil {
+		if err := rows.Scan(&v.ID, &v.SenderID, &v.ReceiverID, &v.Name, &v.MimeType, &v.Size, &v.ViewOnce, &v.ViewedAt, &v.CreatedAt, &v.ExpiresAt, &v.Kind); err != nil {
 			writeError(w, 500, "Gagal membaca media")
 			return
 		}
@@ -540,10 +450,10 @@ func (a *App) mediaGet(w http.ResponseWriter, r *http.Request, u *User) {
 		return
 	}
 	var sender, receiver int64
-	var name, mime string
+	var name, mime, kind string
 	var once bool
 	var viewed sql.NullTime
-	err := a.db.QueryRowContext(r.Context(), `SELECT sender_id,receiver_id,original_name,mime_type,view_once,viewed_at FROM media_files WHERE id=$1 AND expires_at>NOW()`, id).Scan(&sender, &receiver, &name, &mime, &once, &viewed)
+	err := a.db.QueryRowContext(r.Context(), `SELECT sender_id,receiver_id,original_name,mime_type,kind,view_once,viewed_at FROM media_files WHERE id=$1 AND deleted_for_everyone=FALSE AND expires_at>NOW()`, id).Scan(&sender, &receiver, &name, &mime, &kind, &once, &viewed)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, "Media kedaluwarsa atau tidak ditemukan")
 		return
@@ -557,7 +467,7 @@ func (a *App) mediaGet(w http.ResponseWriter, r *http.Request, u *User) {
 		writeError(w, 403, "Tidak berhak mengakses media")
 		return
 	}
-	if !adminDownload {
+	if !adminDownload && !(kind == "sticker" && sender == receiver && sender == u.ID) {
 		ok, err := a.areContacts(r, sender, receiver)
 		if err != nil || !ok {
 			writeError(w, 403, "Bukan kontak aktif")

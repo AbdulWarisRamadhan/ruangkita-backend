@@ -12,7 +12,7 @@ func TestRunMigrationsIntegration(t *testing.T) {
 		t.Skip("set RUANGKITA_RUN_MIGRATION_INTEGRATION=1 untuk menjalankan pengujian integrasi")
 	}
 
-	const allowedDatabase = "ruangkita_v4_migration_test"
+	const allowedDatabase = "ruangkita_v4_webpush_test"
 	if os.Getenv("DB_NAME") != allowedDatabase {
 		t.Fatalf("pengujian hanya boleh menggunakan database %q", allowedDatabase)
 	}
@@ -21,13 +21,11 @@ func TestRunMigrationsIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("konfigurasi koneksi: %v", err)
 	}
-
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("membuka database: %v", err)
 	}
 	defer db.Close()
-
 	db.SetMaxOpenConns(2)
 	db.SetConnMaxLifetime(time.Minute)
 	if err := db.Ping(); err != nil {
@@ -42,13 +40,12 @@ func TestRunMigrationsIntegration(t *testing.T) {
 		t.Fatalf("database aktif %q tidak diizinkan", actualDatabase)
 	}
 
-	// Pengujian ini tidak menghapus atau mengatur ulang database.
-	// Hanya database pengujian yang masih kosong yang boleh dipakai.
+	// Jangan pernah menghapus atau mengatur ulang tabel secara otomatis.
 	var existingTables int
 	if err := db.QueryRow(`
-        SELECT count(*) FROM information_schema.tables
-        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-    `).Scan(&existingTables); err != nil {
+  SELECT count(*) FROM information_schema.tables
+  WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+ `).Scan(&existingTables); err != nil {
 		t.Fatalf("memeriksa tabel awal: %v", err)
 	}
 	if existingTables != 0 {
@@ -62,11 +59,11 @@ func TestRunMigrationsIntegration(t *testing.T) {
 	for _, tableName := range []string{"users", "sessions", "messages", "schema_migrations"} {
 		var exists bool
 		if err := db.QueryRow(`
-            SELECT EXISTS (
-                SELECT 1 FROM information_schema.tables
-                WHERE table_schema = 'public' AND table_name = $1
-            )
-        `, tableName).Scan(&exists); err != nil {
+   SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = $1
+   )
+  `, tableName).Scan(&exists); err != nil {
 			t.Fatalf("memeriksa tabel %s: %v", tableName, err)
 		}
 		if !exists {
@@ -74,22 +71,71 @@ func TestRunMigrationsIntegration(t *testing.T) {
 		}
 	}
 
-	var migrationCount int
-	if err := db.QueryRow("SELECT count(*) FROM schema_migrations WHERE version = $1", "001_base_schema").Scan(&migrationCount); err != nil {
-		t.Fatalf("memeriksa riwayat migrasi: %v", err)
+	var replyColumnExists bool
+	if err := db.QueryRow(`
+  SELECT EXISTS (
+   SELECT 1 FROM information_schema.columns
+   WHERE table_schema = 'public' AND table_name = 'messages'
+     AND column_name = 'reply_to_message_id' AND data_type = 'bigint'
+     AND is_nullable = 'YES'
+  )
+ `).Scan(&replyColumnExists); err != nil {
+		t.Fatalf("memeriksa kolom reply: %v", err)
 	}
-	if migrationCount != 1 {
-		t.Fatalf("versi 001_base_schema tercatat %d kali; diharapkan 1", migrationCount)
+	if !replyColumnExists {
+		t.Error("kolom reply_to_message_id BIGINT NULL belum dibuat")
 	}
 
+	var foreignKeyExists bool
+	if err := db.QueryRow(`
+  SELECT EXISTS (
+   SELECT 1 FROM pg_constraint c
+   JOIN pg_class child ON child.oid = c.conrelid
+   JOIN pg_namespace n ON n.oid = child.relnamespace
+   JOIN pg_class parent ON parent.oid = c.confrelid
+   JOIN pg_attribute attr ON attr.attrelid = child.oid AND attr.attnum = ANY(c.conkey)
+   WHERE n.nspname = 'public' AND child.relname = 'messages'
+     AND parent.relname = 'messages' AND attr.attname = 'reply_to_message_id'
+     AND c.contype = 'f' AND c.confdeltype = 'n'
+  )
+ `).Scan(&foreignKeyExists); err != nil {
+		t.Fatalf("memeriksa foreign key reply: %v", err)
+	}
+	if !foreignKeyExists {
+		t.Error("foreign key reply menuju messages dengan ON DELETE SET NULL tidak ditemukan")
+	}
+
+	var indexExists bool
+	if err := db.QueryRow(`
+  SELECT EXISTS (
+   SELECT 1 FROM pg_indexes
+   WHERE schemaname = 'public' AND tablename = 'messages'
+     AND indexname = 'idx_messages_reply_to'
+  )
+ `).Scan(&indexExists); err != nil {
+		t.Fatalf("memeriksa indeks reply: %v", err)
+	}
+	if !indexExists {
+		t.Error("indeks idx_messages_reply_to tidak ditemukan")
+	}
+
+	checkVersions := func(stage string) {
+		t.Helper()
+		for _, version := range []string{"001_base_schema", "002_message_replies"} {
+			var count int
+			if err := db.QueryRow(
+				"SELECT count(*) FROM schema_migrations WHERE version = $1", version,
+			).Scan(&count); err != nil {
+				t.Fatalf("%s: memeriksa versi %s: %v", stage, version, err)
+			}
+			if count != 1 {
+				t.Errorf("%s: versi %s tercatat %d kali; diharapkan 1", stage, version, count)
+			}
+		}
+	}
+	checkVersions("migrasi pertama")
 	if err := runMigrations(db); err != nil {
 		t.Fatalf("migrasi kedua gagal: %v", err)
 	}
-
-	if err := db.QueryRow("SELECT count(*) FROM schema_migrations WHERE version = $1", "001_base_schema").Scan(&migrationCount); err != nil {
-		t.Fatalf("memeriksa riwayat setelah migrasi kedua: %v", err)
-	}
-	if migrationCount != 1 {
-		t.Fatalf("versi 001_base_schema tercatat %d kali setelah pengulangan; diharapkan 1", migrationCount)
-	}
+	checkVersions("migrasi kedua")
 }
