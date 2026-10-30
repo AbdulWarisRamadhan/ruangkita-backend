@@ -58,7 +58,7 @@ func (a *App) ensureFeatures() error {
 
 func (a *App) areContacts(r *http.Request, left, right int64) (bool, error) {
 	var ok bool
-	err := a.db.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM contacts WHERE user_low=LEAST($1,$2) AND user_high=GREATEST($1,$2))`, left, right).Scan(&ok)
+	err := a.db.QueryRowContext(r.Context(), `SELECT EXISTS(SELECT 1 FROM contacts WHERE user_low=LEAST($1::BIGINT,$2::BIGINT) AND user_high=GREATEST($1::BIGINT,$2::BIGINT))`, left, right).Scan(&ok)
 	return ok, err
 }
 
@@ -218,7 +218,7 @@ func (a *App) contactRespond(w http.ResponseWriter, r *http.Request, u *User) {
 	status := "rejected"
 	if input.Accept {
 		status = "accepted"
-		if _, err = tx.ExecContext(r.Context(), `INSERT INTO contacts(user_low,user_high) VALUES(LEAST($1,$2),GREATEST($1,$2)) ON CONFLICT DO NOTHING`, sender, u.ID); err != nil {
+		if _, err = tx.ExecContext(r.Context(), `INSERT INTO contacts(user_low,user_high) VALUES(LEAST($1::BIGINT,$2::BIGINT),GREATEST($1::BIGINT,$2::BIGINT)) ON CONFLICT DO NOTHING`, sender, u.ID); err != nil {
 			writeError(w, 500, "Gagal menambah kontak")
 			return
 		}
@@ -246,7 +246,7 @@ func (a *App) contactRemove(w http.ResponseWriter, r *http.Request, u *User) {
 		writeError(w, 400, "Kontak tidak valid")
 		return
 	}
-	_, err := a.db.ExecContext(r.Context(), `DELETE FROM contacts WHERE user_low=LEAST($1,$2) AND user_high=GREATEST($1,$2)`, u.ID, input.UserID)
+	_, err := a.db.ExecContext(r.Context(), `DELETE FROM contacts WHERE user_low=LEAST($1::BIGINT,$2::BIGINT) AND user_high=GREATEST($1::BIGINT,$2::BIGINT)`, u.ID, input.UserID)
 	if err != nil {
 		writeError(w, 500, "Gagal menghapus kontak")
 		return
